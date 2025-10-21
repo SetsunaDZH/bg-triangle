@@ -22,7 +22,7 @@ from arguments import (
     PipelineParams,
 )
 
-from model import BPrimitiveBezier, GaussianModel
+from model import BPrimitiveSubdivision, GaussianModel
 from render import Renderer, network_gui, render_3dgs
 from scene import Scene
 from scene.cameras import Camera
@@ -65,7 +65,7 @@ class Trainer(object):
         self.first_iter = 0
         self.tb_writer = prepare_output_and_logger(dataset_args)
 
-        self.bprimitive_object = BPrimitiveBezier(
+        self.bprimitive_object = BPrimitiveSubdivision(
             order=dataset_args.order,
             sh_degree=dataset_args.sh_degree,
             optimizer_type=optimzer_args.optimizer_type

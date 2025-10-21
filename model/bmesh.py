@@ -2,7 +2,7 @@ from pytorch3d.renderer.cameras import FoVPerspectiveCameras, try_get_projection
 import torch
 import torch.nn as nn
 import pdb
-from model.bprimitive_bezier import BPrimitiveBezier
+from model.bprimitive_subdivision import BPrimitiveSubdivision
 from model.gaussian import pixel_to_non_square_ndc
 from brasterizer import BMeshRasterizer, BMeshRasterizationSettings
 from utils.image_utils import gaussian_blur, median_filter_2d
@@ -35,12 +35,12 @@ class BMeshObject(object):
 
     @classmethod
     def from_bprimitive_version_1(cls,
-        bprimitive: BPrimitiveBezier,
+        bprimitive: BPrimitiveSubdivision,
         num_segments_per_bprimitive_edge: int
     ) -> "BMeshObject":
         """
         Args:
-            bprimitive (BPrimitiveBezier): B-primitive.
+            bprimitive (BPrimitiveSubdivision): B-primitive.
             num_segments_per_bprimitive_edge (int): Number of segments per edge.
 
         Returns:
@@ -112,7 +112,7 @@ class BMeshRenderer(nn.Module):
 
     def forward(self,
         camera,
-        bprimitive_object: BPrimitiveBezier,
+        bprimitive_object: BPrimitiveSubdivision,
         bmesh_object: BMeshObject,
         rasterizer_settings: BMeshRasterizationSettings,
         render_type: str
