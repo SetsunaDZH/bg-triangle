@@ -3,7 +3,7 @@ from pytorch3d.renderer.cameras import FoVPerspectiveCameras
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from model.bprimitive_bezier import BPrimitiveBezier
+from model.bprimitive_subdivision import BPrimitiveSubdivision
 from diff_brasterization import GaussianRasterizer, GaussianRasterizationSettings
 
 
@@ -54,7 +54,7 @@ class GaussianObject(nn.Module):
         self.normal = normal
 
     @classmethod
-    def from_bprimitive_version_1(cls, valid_bids, valid_uvws, bprimitive: BPrimitiveBezier):
+    def from_bprimitive_version_1(cls, valid_bids, valid_uvws, bprimitive: BPrimitiveSubdivision):
         """
         For each pixel in the bprimitive_image is a GS.
         """
@@ -84,7 +84,7 @@ class GaussianObject(nn.Module):
         return cls(xyz, scaling, rotation, opacity, features_dc, features_rest, bprimitive.active_sh_degree)
 
     @classmethod
-    def from_bprimitive_version_2(cls,  bprimitive: BPrimitiveBezier):
+    def from_bprimitive_version_2(cls,  bprimitive: BPrimitiveSubdivision):
         """
         Each  bprimitive has own Gaussians
         """
@@ -132,7 +132,7 @@ class GaussianObject(nn.Module):
         return cls(xyz, scaling, rotation, opacity, features_dc, features_rest, bprimitive.active_sh_degree), bids
     
     @classmethod
-    def from_bprimitive_version_3(cls, valid_bids, valid_uvws, bprimitive: BPrimitiveBezier):
+    def from_bprimitive_version_3(cls, valid_bids, valid_uvws, bprimitive: BPrimitiveSubdivision):
         """
         Each  bprimitive has own Gaussians
         """

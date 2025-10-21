@@ -4,7 +4,7 @@ Minye Wu*, Haizhao Dai*, Kaixin Yao,  Tinne Tuytelaars#, and Jingyi Yu#.</br>
 
 ![framework](teaser.png)
 
-
+> 📘 **细分曲面替换说明**：项目已经将 Bézier 三角面实现替换为细分曲面评估器，详细的设计动机与接口兼容性说明见 [`docs/subdivision_surface_overview.md`](docs/subdivision_surface_overview.md)。
 
 ## Abstract
 Differentiable rendering enables efficient optimization by allowing gradients to be computed through the rendering process, facilitating 3D reconstruction, inverse rendering and neural scene representation learning. To ensure differentiability, existing solutions approximate or re-formulate traditional rendering operations using smooth, probabilistic proxies such as volumes or Gaussian primitives. Consequently, they struggle to preserve sharp edges due to the lack of explicit boundary definitions. We present a novel hybrid representation, Bézier Gaussian Triangle (BG-Triangle), that combines Bézier triangle-based vector graphics primitives with Gaussian-based probabilistic models, to maintain accurate shape modeling while conducting resolution-independent differentiable rendering. We present a robust and effective discontinuity-aware rendering technique to reduce uncertainties at object boundaries. We also employ an adaptive densification and pruning scheme for efficient training while reliably handling level-of-detail (LoD) variations. Experiments show that BG-Triangle achieves comparable rendering quality as 3DGS but with superior boundary preservation. More importantly, BG-Triangle uses a much smaller number of primitives than its alternatives, showcasing the benefits of vectorized graphics primitives and the potential to bridge the gap between classic and emerging representations.

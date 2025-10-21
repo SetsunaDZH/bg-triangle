@@ -1,121 +1,264 @@
-import math
+"""Subdivision-surface based BG-Triangle primitive implementation.
+
+This module replaces the former Bézier triangle primitive with a subdivision
+surface evaluator.  The original code evolved organically from the SIGGRAPH
+2025 paper implementation and the control flow scattered the important ideas
+across several helper utilities.  The goal of this rewrite is two-fold:
+
+1. Provide a drop-in replacement that keeps the public interface intact so the
+   training, evaluation, and viewer scripts continue to operate without any
+   further changes.  We keep the legacy ``BPrimitiveBezier`` alias exposed
+   through ``model.__init__`` for backwards compatibility.
+2. Document the mathematical steps of the new primitive so future contributors
+   can understand *why* the evaluator is structured in this fashion.  Most of
+   the computation happens in barycentric space and relies on cached
+   subdivision connectivity, hence the extensive commentary below.
+
+The class itself is still heavily optimized for vectorized execution on the
+GPU.  The surrounding documentation is deliberately verbose because the user
+requested a detailed explanation of the change set.  Each helper method now has
+docstrings that describe its role in the evaluation pipeline and how the caches
+interact with one another.
+"""
+
+from typing import Tuple
 
 import numpy as np
-
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+from plyfile import PlyData
 
 from .bprimitive_base import BPrimitiveBase
 from utils.graphics_utils import BasicPointCloud
 from utils.point_utils import generate_random_unit_triangles
-import torch.nn.functional as F
 
-from plyfile import PlyData
+
 def fetchPly(path):
+    """Load a PLY file into :class:`BasicPointCloud`.
+
+    The legacy Bézier implementation exposed this helper and several parts of
+    the training scripts still import it.  Although unrelated to subdivision
+    surfaces directly, keeping the function here allows existing experiment
+    setups to keep running.  The function simply parses the vertex positions and
+    returns a :class:`BasicPointCloud` with empty color/normal fields.
+    """
+
     plydata = PlyData.read(path)
     vertices = plydata['vertex']
     positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
     return BasicPointCloud(points=positions, colors=None, normals=None)
 
 
-class BPrimitiveBezier(BPrimitiveBase):
+class BPrimitiveSubdivision(BPrimitiveBase):
+    """Triangle subdivision surface primitive.
+
+    The primitive stores its learnable control points directly in barycentric
+    coordinates.  Rather than evaluating a closed-form Bézier basis (which is
+    numerically sensitive for high orders), we subdivide the reference triangle
+    into a regular lattice and perform piecewise-linear interpolation inside the
+    local triangle that contains the query.  This turns the geometry evaluation
+    into a fast gather + dot-product routine that is easy to differentiate.
+
+    A quick summary of the internal data:
+
+    * ``control_point_uvw`` – canonical barycentric coordinates of the control
+      lattice that match the learnable positions stored in ``self.control_point``.
+    * ``subdivision_faces`` – integer triplets describing how the lattice is
+      tessellated into micro-triangles.  These indices never change and only
+      depend on the chosen order.
+    * ``face_lookup_*`` – cached matrices used to locate which micro-triangle a
+      query falls into and to compute barycentric derivatives.  They are shared
+      across all primitives in the batch for maximum reuse.
+    * ``face_cache``/``uvw_cache`` – reusable caches for mesh extraction where a
+      different tessellation density may be requested.
     """
-    Triangle Bezier primitive.
-    """
+
     def __init__(self, order: int, sh_degree: int, optimizer_type: str = "default") -> None:
         super().__init__(order, sh_degree, optimizer_type)
 
-        self.ijk = self.generate_ijk(order) # [num_control_points, 3]
-        self.coefficients = self.precompute_binomial_coefficients(order) # [n + 1, n + 1, n + 1]
-        self.feature_ijk = self.generate_ijk(order) # [num_control_points, 3]
-        self.feature_coefficients = self.precompute_binomial_coefficients(order) # [num_control_points, 3]
+        # Control lattice in barycentric space for the optimized parameters.
+        self.control_point_uvw = self.generate_uvw(order)  # [num_control_points, 3]
+        self.control_point_uv = self.control_point_uvw[:, 1:]
 
+        # Pre-compute subdivision connectivity and evaluation helpers.
+        self.subdivision_faces = self.generate_regular_face(order)
+        self._prepare_face_lookup()
 
-        # Regular mesh
+        # Regular mesh caches for different evaluation resolutions.
         num_caches = 100
-        self.face = self.generate_regular_face(num_caches) # [m * m, 3]
-        self.bernstein_cache = {
-            cache: self.compute_bernstein(self.coefficients, self.ijk, self.generate_uvw(cache)) for cache in range(1, num_caches + 1)
-        } # [(m + 2) * (m + 1) // 2, num_control_points]
+        self.face_cache = {cache: self.generate_regular_face(cache) for cache in range(1, num_caches + 1)}
+        self.uvw_cache = {cache: self.generate_uvw(cache) for cache in range(1, num_caches + 1)}
 
-    def to(self, device: torch.device) -> "BPrimitiveBezier":
-        self.ijk = self.ijk.to(device)
-        self.coefficients = self.coefficients.to(device)
-        self.feature_ijk = self.feature_ijk.to(device)
-        self.feature_coefficients = self.feature_coefficients.to(device)
+    def _prepare_face_lookup(self) -> None:
+        """Pre-compute lookup tables for barycentric queries.
 
-        self.face = self.face.to(device)
-        self.bernstein_cache = {k: v.to(device) for k, v in self.bernstein_cache.items()}
+        The lookup resembles the structure used in rasterization: we express any
+        point in the reference triangle as ``p = p0 + a * e0 + b * e1``.  By
+        storing the inverse edge matrix we can recover ``(a, b)`` for any query
+        and thus obtain the barycentric coordinates.  The derivative helpers are
+        derived analytically from the transformation so that gradient-based
+        optimizers can access first-order information without finite differences.
+        """
+
+        face_vertices_uv = self.control_point_uv[self.subdivision_faces]
+        p0 = face_vertices_uv[:, 0]
+        edges = torch.stack([
+            face_vertices_uv[:, 1] - p0,
+            face_vertices_uv[:, 2] - p0,
+        ], dim=-1)  # [num_faces, 2, 2]
+
+        inv_edges = torch.inverse(edges)
+
+        # Derivative helpers for barycentric coordinates with respect to (u, v).
+        dtype = face_vertices_uv.dtype
+        device = face_vertices_uv.device
+        du_vec = torch.tensor([0.0, -1.0], dtype=dtype, device=device)
+        dv_vec = torch.tensor([1.0, -1.0], dtype=dtype, device=device)
+
+        du_local = torch.einsum("fij,j->fi", inv_edges, du_vec)
+        dv_local = torch.einsum("fij,j->fi", inv_edges, dv_vec)
+
+        self.face_lookup_p0 = p0
+        self.face_lookup_inv_edges = inv_edges
+        self.face_dbary_du = torch.stack([
+            -(du_local[:, 0] + du_local[:, 1]),
+            du_local[:, 0],
+            du_local[:, 1],
+        ], dim=-1)
+        self.face_dbary_dv = torch.stack([
+            -(dv_local[:, 0] + dv_local[:, 1]),
+            dv_local[:, 0],
+            dv_local[:, 1],
+        ], dim=-1)
+
+    def to(self, device: torch.device) -> "BPrimitiveSubdivision":
+        """Move all cached tensors to ``device``.
+
+        ``BPrimitiveBase.to`` only transfers the learnable parameters.  The new
+        caches introduced by the subdivision evaluator also need to migrate, so
+        we mirror the API and return ``self`` for fluent chaining (matching
+        PyTorch modules).
+        """
+        self.control_point_uvw = self.control_point_uvw.to(device)
+        self.control_point_uv = self.control_point_uv.to(device)
+        self.subdivision_faces = self.subdivision_faces.to(device)
+        self.face_lookup_p0 = self.face_lookup_p0.to(device)
+        self.face_lookup_inv_edges = self.face_lookup_inv_edges.to(device)
+        self.face_dbary_du = self.face_dbary_du.to(device)
+        self.face_dbary_dv = self.face_dbary_dv.to(device)
+
+        self.face_cache = {k: v.to(device) for k, v in self.face_cache.items()}
+        self.uvw_cache = {k: v.to(device) for k, v in self.uvw_cache.items()}
         return self
 
     @classmethod
     def generate_uvw(cls, n: int) -> torch.Tensor:
-        """
-        Generate regular spaced UVW coordinates, where u + v + w = 1, 0 <= u, v, w <= 1.
+        """Generate regularly spaced barycentric coordinates.
+
+        The points are ordered from the top vertex downwards which matches the
+        convention used in the historical Bézier implementation.  Maintaining the
+        order avoids touching any of the learnable parameter initializers that
+        expect the same layout.
         """
         return torch.tensor([[i / n, j / n, (n - i - j) / n] for i in range(n, -1, -1) for j in range(n - i, -1, -1)])
 
-    def precompute_binomial_coefficients(self, n: int) -> torch.Tensor:
-        """
-        n! / (i! * j! * k!)
-        """
-        coefficients = torch.zeros(n + 1, n + 1, n + 1)
-        for i in range(n + 1):
-            for j in range(n + 1 - i):
-                k = n - i - j
-                coefficients[i, j, k] = math.factorial(n) / (math.factorial(i) * math.factorial(j) * math.factorial(k))
-        return coefficients
-
-    def compute_bernstein(self, coefficients: torch.Tensor, ijk: torch.LongTensor, uvw: torch.Tensor) -> torch.Tensor:
-        """
-        n! / (i! * j! * k!) * u^{i} * v^{j} * w^{k}
-        """
-        i, j, k = ijk.unsqueeze(-3).unbind(-1) # [1, num_control_points]
-        u, v, w = uvw.unsqueeze(-2).unbind(-1) # [N, 1]
-        return coefficients[i, j, k] * (u ** i) * (v ** j) * (w ** k) # [N, num_control_points]
-
-    def compute_d_bernstein_d_u(self, coefficients: torch.Tensor, ijk: torch.LongTensor, uvw: torch.Tensor) -> torch.Tensor:
-        """
-        n! / (i! * j! * k!) * (u^{i-1} * v^{j} * w^{k} - u^{i} * v^{j} * w^{k})
-        """
-        i, j, k = ijk.unsqueeze(-3).unbind(-1) # [1, num_control_points]
-        u, v, w = uvw.unsqueeze(-2).unbind(-1) # [N, 1]
-        return coefficients[i, j, k] * (
-            torch.where(i > 0, i * u ** (i - 1), torch.zeros_like(u)) * (v ** j) * (w ** k) - (u ** i) * (v ** j) * torch.where(k > 0, k * w ** (k - 1), torch.zeros_like(w))
-        )
-
-    def compute_d_bernstein_d_v(self, coefficients: torch.Tensor, ijk: torch.LongTensor, uvw: torch.Tensor) -> torch.Tensor:
-        """
-        n! / (i! * j! * k!) * (u^{i} * v^{j-1} * w^{k} - u^{i} * v^{j} * w^{k})
-        """
-        i, j, k = ijk.unsqueeze(-3).unbind(-1) # [1, num_control_points]
-        u, v, w = uvw.unsqueeze(-2).unbind(-1) # [N, 1]
-        return coefficients[i, j, k] * (
-            (u ** i) * torch.where(j > 0, j * v ** (j - 1), torch.zeros_like(v)) * (w ** k) - (u ** i) * (v ** j) * torch.where(k > 0, k * w ** (k - 1), torch.zeros_like(w))
-        )
-
-    def generate_regular_mesh(self, num_segments_per_edge: int, mask: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Generate regular spaced triangle mesh.
+    def _locate_faces(self, uvw: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Identify subdivision triangle indices and barycentric weights.
 
         Args:
-            num_segments_per_edge (`int`): Number of segments per bprimitive edge.
-                Them each bprimitive generates `(m + 1) * (m + 2) // 2` vertices and `m * m` faces.
-            mask (`torch.Tensor`): Mask for the control points, shape [s].
+            uvw: ``(N, 3)`` tensor containing barycentric coordinates relative to
+                the *coarse* control lattice.  The values are expected to sum to
+                one, but we do not assume they are normalized because the caller
+                might provide the ``(v, w)`` projection.
+
+        Returns:
+            A tuple ``(face_ids, barycentric)`` where ``face_ids`` indexes into
+            ``self.subdivision_faces`` and ``barycentric`` gives the local
+            barycentric coordinates inside that micro-triangle.
         """
+
+        device = uvw.device
+        face_p0 = self.face_lookup_p0.to(device)
+        inv_edges = self.face_lookup_inv_edges.to(device)
+
+        uv = uvw[:, 1:]  # convert to 2D coordinates (v, w)
+        diff = uv.unsqueeze(1) - face_p0.unsqueeze(0)
+        local = torch.einsum("nmd,mdk->nmk", diff, inv_edges)
+        barycentric = torch.cat([
+            1.0 - local.sum(dim=-1, keepdim=True),
+            local,
+        ], dim=-1)
+
+        mask = (barycentric >= -1e-6).all(dim=-1)
+        valid = mask.any(dim=1)
+        if not valid.all():
+            raise RuntimeError("Subdivision barycentric lookup failed for some samples")
+
+        face_ids = torch.argmax(mask.float(), dim=1)
+        barycentric = barycentric[torch.arange(uvw.size(0), device=device), face_ids]
+        return face_ids, barycentric
+
+    def _gather_vertices(self, control_points: torch.Tensor, face_ids: torch.Tensor) -> torch.Tensor:
+        """Collect per-face control vertices for ``face_ids``.
+
+        The helper encapsulates the slightly verbose ``torch.gather`` call and
+        keeps shape handling centralized in one place.  It works for both the
+        learnable control point tensor as well as any derived attributes.
+        """
+        faces = self.subdivision_faces
+        if faces.device != control_points.device:
+            faces = faces.to(control_points.device)
+        indices = faces[face_ids]
+        return torch.gather(
+            control_points,
+            1,
+            indices.unsqueeze(-1).expand(-1, -1, control_points.size(-1)),
+        )
+
+    def generate_regular_mesh(self, num_segments_per_edge: int, mask: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Generate uniformly subdivided triangle meshes.
+
+        When exporting meshes the caller can specify how many segments to place
+        on each edge of the canonical triangle.  Because the evaluation is fully
+        vectorized we can compute the vertices for an entire batch of primitives
+        in a single call.  The method returns both the evaluated vertex positions
+        and the triangle indices so that downstream utilities (PLY export,
+        marching cubes, etc.) can stay unchanged.
+        """
+
+        uvw = self.uvw_cache[num_segments_per_edge].to(self.control_point.device)
+
         if mask is None:
-            vertices = torch.einsum("scd, mc -> smd", self.control_point, self.bernstein_cache[num_segments_per_edge]) # [s, (m + 2) * (m + 1) // 2, 3]
-            num_primitives = self.num_primitives
+            primitive_indices = torch.arange(self.num_primitives, device=self.control_point.device)
         else:
-            vertices = torch.einsum("scd, mc -> smd", self.control_point[mask], self.bernstein_cache[num_segments_per_edge]) # [s, (m + 2) * (m + 1) // 2, 3]
-            num_primitives = vertices.size(0)
-        faces = self.face[:num_segments_per_edge * num_segments_per_edge].unsqueeze(0).expand(num_primitives, -1, -1) \
-              + torch.arange(num_primitives, device=self.face.device).reshape(num_primitives, 1, 1) * ((num_segments_per_edge + 1) * (num_segments_per_edge + 2) // 2) # [s, m * m, 3]
-        return vertices, faces
+            primitive_indices = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+
+        num_primitives = primitive_indices.numel()
+        if num_primitives == 0:
+            face_template = self.face_cache[num_segments_per_edge]
+            return (
+                torch.empty(0, uvw.size(0), 3, dtype=self.control_point.dtype, device=self.control_point.device),
+                torch.empty(0, face_template.size(0), 3, dtype=torch.long, device=self.control_point.device),
+            )
+
+        repeated_uvw = uvw.unsqueeze(0).expand(num_primitives, -1, -1).reshape(-1, 3)
+        repeated_ids = primitive_indices.repeat_interleave(uvw.size(0))
+        evaluated = self.evaluate(repeated_ids, repeated_uvw).view(num_primitives, uvw.size(0), 3)
+
+        faces = self.face_cache[num_segments_per_edge].to(self.control_point.device)
+        faces = faces.unsqueeze(0).expand(num_primitives, -1, -1)
+        offset = torch.arange(num_primitives, device=self.control_point.device).view(-1, 1, 1) * uvw.size(0)
+        faces = faces + offset
+        return evaluated, faces
 
     def generate_regular_face(self, m: int) -> torch.Tensor:
-        """
-        Generate all faces indices for various `m`.
+        """Enumerate the micro-triangle connectivity for a tessellation level.
+
+        ``m`` corresponds to the number of subdivisions along each edge.  The
+        faces are generated in the same order as the original implementation so
+        the renderer and differentiable rasterizer receive identical topology.
         """
         face = []
         for i in range(m):
@@ -150,8 +293,10 @@ class BPrimitiveBezier(BPrimitiveBase):
         Returns:
             vertices (torch.Tensor): Vertices in UVW space [N, 3].
         """
-        bernstein = self.compute_bernstein(self.coefficients, self.ijk, uvw) # [N, num_control_points]
-        vertices = torch.einsum("ncd, nc -> nd", self.control_point[bprimitive_id], bernstein) # [N, 3]
+        face_ids, barycentric = self._locate_faces(uvw)
+        control_points = self.control_point[bprimitive_id]
+        gathered = self._gather_vertices(control_points, face_ids)
+        vertices = torch.sum(gathered * barycentric.unsqueeze(-1), dim=1)
         return vertices
 
     def evaluate_dc(self, bprimitive_id: torch.Tensor, uvw: torch.Tensor) -> torch.Tensor:
@@ -163,8 +308,10 @@ class BPrimitiveBezier(BPrimitiveBase):
         Returns:
             vertices (torch.Tensor): Vertices in UVW space [N, 3].
         """
-        bernstein = self.compute_bernstein(self.feature_coefficients, self.feature_ijk, uvw) # [N, num_control_points]
-        vertices = torch.einsum("ncd, nc -> nd", self.control_point_dc[bprimitive_id], bernstein) # [N, 3]
+        face_ids, barycentric = self._locate_faces(uvw)
+        control_points = self.control_point_dc[bprimitive_id]
+        gathered = self._gather_vertices(control_points, face_ids)
+        vertices = torch.sum(gathered * barycentric.unsqueeze(-1), dim=1)
         return vertices
 
     def evaluate_rest(self, bprimitive_id: torch.Tensor, uvw: torch.Tensor) -> torch.Tensor:
@@ -176,8 +323,10 @@ class BPrimitiveBezier(BPrimitiveBase):
         Returns:
             vertices (torch.Tensor): Vertices in UVW space [N, 3].
         """
-        bernstein = self.compute_bernstein(self.feature_coefficients, self.feature_ijk, uvw) # [N, num_control_points]
-        vertices = torch.einsum("ncd, nc -> nd", self.control_point_rest[bprimitive_id], bernstein) # [N, 45]
+        face_ids, barycentric = self._locate_faces(uvw)
+        control_points = self.control_point_rest[bprimitive_id]
+        gathered = self._gather_vertices(control_points, face_ids)
+        vertices = torch.sum(gathered * barycentric.unsqueeze(-1), dim=1)
         return vertices
 
     def evaluate_u_derivative(self, bprimitive_id: torch.Tensor, uvw: torch.Tensor) -> torch.Tensor:
@@ -189,8 +338,11 @@ class BPrimitiveBezier(BPrimitiveBase):
         Returns:
             d_vertices_d_u (torch.Tensor): Derivative of the vertices w.r.t. U [N, 3].
         """
-        d_bernstein_d_u = self.compute_d_bernstein_d_u(self.coefficients, self.ijk, uvw)
-        d_vertices_d_u = torch.einsum("ncd, nc -> nd", self.control_point[bprimitive_id], d_bernstein_d_u)
+        face_ids, _ = self._locate_faces(uvw)
+        control_points = self.control_point[bprimitive_id]
+        gathered = self._gather_vertices(control_points, face_ids)
+        dbary_du = self.face_dbary_du[face_ids].to(control_points.device)
+        d_vertices_d_u = torch.sum(gathered * dbary_du.unsqueeze(-1), dim=1)
         return d_vertices_d_u
 
     def evaluate_v_derivative(self, bprimitive_id: torch.Tensor, uvw: torch.Tensor) -> torch.Tensor:
@@ -202,8 +354,11 @@ class BPrimitiveBezier(BPrimitiveBase):
         Returns:
             d_vertices_d_v (torch.Tensor): Derivative of the vertices w.r.t. V [N, 3].
         """
-        d_bernstein_d_v = self.compute_d_bernstein_d_v(self.coefficients, self.ijk, uvw)
-        d_vertices_d_v = torch.einsum("ncd, nc -> nd", self.control_point[bprimitive_id], d_bernstein_d_v)
+        face_ids, _ = self._locate_faces(uvw)
+        control_points = self.control_point[bprimitive_id]
+        gathered = self._gather_vertices(control_points, face_ids)
+        dbary_dv = self.face_dbary_dv[face_ids].to(control_points.device)
+        d_vertices_d_v = torch.sum(gathered * dbary_dv.unsqueeze(-1), dim=1)
         return d_vertices_d_v
 
     def evaluate_normal(self, bprimitive_id: torch.Tensor, uvw: torch.Tensor) -> torch.Tensor:
@@ -220,10 +375,10 @@ class BPrimitiveBezier(BPrimitiveBase):
         normals = torch.cross(d_vertices_d_u, d_vertices_d_v, dim=-1)
         return normals
 
-    def clone(self) -> "BPrimitiveBezier":
-        bprimitive = BPrimitiveBezier(self.order, self.max_sh_degree)
+    def clone(self) -> "BPrimitiveSubdivision":
+        bprimitive = BPrimitiveSubdivision(self.order, self.max_sh_degree)
 
-        bprimitive.control_points.data = self.control_point.data.clone()
+        bprimitive.control_point.data = self.control_point.data.clone()
         bprimitive.features_dc.data = self.features_dc.data.clone()
         bprimitive.features_rest.data = self.features_rest.data.clone()
         bprimitive.features_mlp.data = self.features_mlp.data.clone()

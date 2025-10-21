@@ -7,9 +7,11 @@ from .bprimitive_base import (
     BPrimitiveBase,
 )
 
-from .bprimitive_bezier import (
-    BPrimitiveBezier,
+from .bprimitive_subdivision import (
+    BPrimitiveSubdivision,
 )
+
+BPrimitiveBezier = BPrimitiveSubdivision
 
 from .gaussian import (
     GaussianObject,
