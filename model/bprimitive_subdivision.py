@@ -191,13 +191,25 @@ class BPrimitiveSubdivision(BPrimitiveBase):
             local,
         ], dim=-1)
 
-        mask = (barycentric >= -1e-6).all(dim=-1)
-        valid = mask.any(dim=1)
-        if not valid.all():
+        # Normalise the barycentric coordinates to counter floating point drift.
+        barycentric_sum = barycentric.sum(dim=-1, keepdim=True)
+        barycentric = barycentric / barycentric_sum
+
+        # Pick the face whose minimal barycentric component is the largest. This is
+        # equivalent to testing whether a point lies inside the triangle while being
+        # robust against tiny negative values caused by float precision.
+        min_bary = barycentric.min(dim=-1).values
+        face_ids = torch.argmax(min_bary, dim=1)
+        best_min = min_bary.gather(1, face_ids.unsqueeze(-1)).squeeze(-1)
+
+        tolerance = 1e-5
+        if torch.any(best_min < -tolerance):
             raise RuntimeError("Subdivision barycentric lookup failed for some samples")
 
-        face_ids = torch.argmax(mask.float(), dim=1)
-        barycentric = barycentric[torch.arange(uvw.size(0), device=device), face_ids]
+        sample_indices = torch.arange(uvw.size(0), device=device)
+        barycentric = barycentric[sample_indices, face_ids]
+        barycentric = torch.clamp(barycentric, min=0.0)
+        barycentric = barycentric / barycentric.sum(dim=-1, keepdim=True)
         return face_ids, barycentric
 
     def _gather_vertices(self, control_points: torch.Tensor, face_ids: torch.Tensor) -> torch.Tensor:

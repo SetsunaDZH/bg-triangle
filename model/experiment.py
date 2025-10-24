@@ -106,13 +106,16 @@ def experimental_tetrahedron_get_bprimitive_gaussian(
         bp_gs (GaussianModel): Gaussian model (6 * num_samples_per_cube_edge ** 2 * (num_samples + 1) * (num_samples + 2) // 2).
     """
 
-    tetrahedron_bprimitive = BPrimitiveSubdivision(4)
-    tetrahedron_bprimitive.control_points = torch.Tensor([
-        [[1, 1, 1], [0, 1, 1], [0, 1, -1]],
-        [[1, 1, 1], [0, 1, 1], [-1, -1, -1]],
-        [[1, 1, 1], [0, 1, -1], [-1, -1, -1]],
-        [[0, 1, 1], [0, 1, -1], [-1, -1, -1]],
-    ])
+    tetrahedron_bprimitive = BPrimitiveSubdivision(4, sh_degree=0)
+    base_control_points = torch.tensor([
+        [[1.0, 1.0, 1.0], [0.0, 1.0, 1.0], [0.0, 1.0, -1.0]],
+        [[1.0, 1.0, 1.0], [0.0, 1.0, 1.0], [-1.0, -1.0, -1.0]],
+        [[1.0, 1.0, 1.0], [0.0, 1.0, -1.0], [-1.0, -1.0, -1.0]],
+        [[0.0, 1.0, 1.0], [0.0, 1.0, -1.0], [-1.0, -1.0, -1.0]],
+    ], dtype=torch.float32)
+    tetrahedron_bprimitive.control_point = base_control_points
+    tetrahedron_bprimitive.control_points = base_control_points
+    tetrahedron_bprimitive.num_primitives = base_control_points.size(0)
     all_points, all_indices = tetrahedron_bprimitive.generate_regular_mesh(num_samples_per_cube_edge)
     all_points = all_points.reshape(-1, 3)
     all_indices = all_indices.reshape(-1, 3)
@@ -147,10 +150,13 @@ def experimental_triangle_get_bprimitive_gaussian(
     #         [0.0, 1.0, 0.0], [-2/3, 1/3, 0.0], [-1, -1/3, 0.0], [-1.0, -1.0, 0.0]
     #     ],
     # ])
-    tetrahedron_bprimitive = BPrimitiveSubdivision(1)
-    tetrahedron_bprimitive.control_points = torch.Tensor([
+    tetrahedron_bprimitive = BPrimitiveSubdivision(1, sh_degree=0)
+    base_control_points = torch.tensor([
         [[1.0, 1.0, 0.0], [0.0, 1.0, 0.0], [-1.0, -1.0, 0.0]],
-    ])
+    ], dtype=torch.float32)
+    tetrahedron_bprimitive.control_point = base_control_points
+    tetrahedron_bprimitive.control_points = base_control_points
+    tetrahedron_bprimitive.num_primitives = base_control_points.size(0)
     all_points, all_indices = tetrahedron_bprimitive.generate_regular_mesh(num_samples_per_cube_edge)
     all_points = all_points.reshape(-1, 3)
     all_indices = all_indices.reshape(-1, 3)
@@ -180,10 +186,13 @@ def experimental_triangle_get_bprimitive_random(
 
     
 
-    tetrahedron_bprimitive = BPrimitiveSubdivision(1)
-    tetrahedron_bprimitive.control_points = torch.Tensor([
+    tetrahedron_bprimitive = BPrimitiveSubdivision(1, sh_degree=0)
+    base_control_points = torch.tensor([
         [[1.0, 1.0, 0.0], [0.0, 1.0, 0.0], [-1.0, -1.0, 0.0]],
-    ])
+    ], dtype=torch.float32)
+    tetrahedron_bprimitive.control_point = base_control_points
+    tetrahedron_bprimitive.control_points = base_control_points
+    tetrahedron_bprimitive.num_primitives = base_control_points.size(0)
     all_points, all_indices = tetrahedron_bprimitive.generate_regular_mesh(num_samples_per_cube_edge)
     all_points = all_points.reshape(-1, 3)
     all_indices = all_indices.reshape(-1, 3)
@@ -195,7 +204,7 @@ def experimental_triangle_get_bprimitive_random(
 
 
     num_primitives = all_indices.shape[0]
-    bprimitive = BPrimitiveSubdivision(order)
+    bprimitive = BPrimitiveSubdivision(order, sh_degree=0)
     bprimitive.control_points = torch.Tensor([
         [
             [1.0, 1.0, 0.0],
