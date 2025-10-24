@@ -22,7 +22,7 @@ from arguments import (
 )
 import pdb
 
-from model import BPrimitiveBezier, GaussianModel
+from model import BPrimitiveSubdivision, GaussianModel
 from render import Renderer, network_gui, render_3dgs
 from scene import Scene
 from scene.cameras import Camera
@@ -48,7 +48,7 @@ if __name__ == "__main__":
     pipeline_args = pp.extract(args)
 
 
-    bprimitive_object = BPrimitiveBezier(
+    bprimitive_object = BPrimitiveSubdivision(
                 order=dataset_args.order,
                 sh_degree=3,
             )

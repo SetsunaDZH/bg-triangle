@@ -9,7 +9,7 @@ from tqdm import tqdm
 import numpy as np
 
 from arguments import ModelParams, OptimizationParams, PipelineParams, get_combined_args
-from model import BPrimitiveBezier
+from model import BPrimitiveSubdivision
 from render import Renderer
 from scene import Scene
 from utils.general_utils import safe_state
@@ -48,7 +48,7 @@ def render_set(model_path, name, iteration, views, bprimitives, pipeline, backgr
 @torch.no_grad()
 def render_sets(dataset : ModelParams, optimzer_args: OptimizationParams, checkpoint : str, pipeline : PipelineParams, skip_train : bool, skip_test : bool, mode:int, enable_wandb: bool):
     with torch.no_grad():
-        bprimitives = BPrimitiveBezier(dataset.order, dataset.sh_degree)
+        bprimitives = BPrimitiveSubdivision(dataset.order, dataset.sh_degree)
         scene = Scene(dataset, bprimitives, shuffle=False)
         (model_params, _) = torch.load(checkpoint)
         bprimitives.restore(model_params, optimzer_args)
